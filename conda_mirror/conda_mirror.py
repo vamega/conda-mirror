@@ -274,6 +274,20 @@ def _remove_package(pkg_path, reason):
     return pkg_path, msg
 
 
+# This function is derived from code I once found at
+# https://stackoverflow.com/questions/3431825/generating-an-md5-checksum-of-a-file
+def md5sum(filename, blocksize=65536):
+    hash = hashlib.md5()
+
+    def read():
+        return f.read(blocksize)
+
+    with open(filename, "rb") as f:
+        for block in iter(read, b""):
+            hash.update(block)
+    return hash.hexdigest()
+
+
 def _validate(filename, md5=None, size=None):
     """Validate the conda package tarfile located at `filename` with any of the
     passed in options `md5` or `size. Also implicitly validate that
@@ -309,7 +323,7 @@ def _validate(filename, md5=None, size=None):
         if os.stat(filename).st_size != size:
             return _remove_package(filename, reason="Failed size test")
     if md5:
-        calc = hashlib.md5(open(filename, 'rb').read()).hexdigest()
+        calc = md5sum(filename)
         if calc != md5:
             return _remove_package(
                 filename,

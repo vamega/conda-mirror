@@ -28,6 +28,7 @@ DEFAULT_PLATFORMS = ['linux-64',
                      'win-64',
                      'win-32']
 
+session = None
 
 def _maybe_split_channel(channel):
     """Split channel if it is fully qualified.
@@ -363,7 +364,7 @@ async def get_repodata(channel, platform):
     return json.get('info', {}), json.get('packages', {})
 
 
-def _download(url, target_directory):
+async def _download(url, target_directory):
     """Download `url` to `target_directory`
 
     Parameters
@@ -601,104 +602,112 @@ async def main(upstream_channel, target_directory, temp_directory, platform,
     if not os.path.exists(os.path.join(target_directory, platform)):
         os.makedirs(os.path.join(target_directory, platform))
 
-    info, packages = await get_repodata(upstream_channel, platform)
-    local_directory = os.path.join(target_directory, platform)
+    global session
+    session = await aiohttp.ClientSession()
+    max_parallel_downloads = 10
+    sem = asyncio.Semaphore(max_parallel_downloads)
 
-    # 1. validate local repo
-    # validating all packages is taking many hours.
-    # _validate_packages(repodata=repodata,
-    #                    package_directory=local_directory,
-    #                    num_threads=num_threads)
+    try:
+        info, packages = await get_repodata(upstream_channel, platform)
+        local_directory = os.path.join(target_directory, platform)
 
-    # 2. figure out blacklisted packages
-    blacklist_packages = {}
-    whitelist_packages = {}
-    # match blacklist conditions
-    if blacklist:
+        # 1. validate local repo
+        # validating all packages is taking many hours.
+        # _validate_packages(repodata=repodata,
+        #                    package_directory=local_directory,
+        #                    num_threads=num_threads)
+
+        # 2. figure out blacklisted packages
         blacklist_packages = {}
-        for blist in blacklist:
-            matched_packages = _match(packages, blist)
-            blacklist_packages.update(matched_packages)
-
-    # 3. un-blacklist packages that are actually whitelisted
-    # match whitelist on blacklist
-    if whitelist:
         whitelist_packages = {}
-        for wlist in whitelist:
-            matched_packages = _match(packages, wlist)
-            whitelist_packages.update(matched_packages)
-    # make final mirror list of not-blacklist + whitelist
-    true_blacklist = set(blacklist_packages.keys()) - set(
-        whitelist_packages.keys())
-    possible_packages_to_mirror = set(packages.keys()) - true_blacklist
+        # match blacklist conditions
+        if blacklist:
+            blacklist_packages = {}
+            for blist in blacklist:
+                matched_packages = _match(packages, blist)
+                blacklist_packages.update(matched_packages)
 
-    # 4. Validate all local packages
-    # construct the desired package repodata
-    desired_repodata = {pkgname: packages[pkgname]
-                        for pkgname in possible_packages_to_mirror}
+        # 3. un-blacklist packages that are actually whitelisted
+        # match whitelist on blacklist
+        if whitelist:
+            whitelist_packages = {}
+            for wlist in whitelist:
+                matched_packages = _match(packages, wlist)
+                whitelist_packages.update(matched_packages)
+        # make final mirror list of not-blacklist + whitelist
+        true_blacklist = set(blacklist_packages.keys()) - set(
+            whitelist_packages.keys())
+        possible_packages_to_mirror = set(packages.keys()) - true_blacklist
 
-    validation_results = _validate_packages(desired_repodata, local_directory, num_threads)
-    summary['validating-existing'].update(validation_results)
-    # 5. figure out final list of packages to mirror
-    # do the set difference of what is local and what is in the final
-    # mirror list
-    local_packages = _list_conda_packages(local_directory)
-    to_mirror = possible_packages_to_mirror - set(local_packages)
-    logger.info('to_mirror')
-    logger.info(pformat(sorted(to_mirror)))
+        # 4. Validate all local packages
+        # construct the desired package repodata
+        desired_repodata = {pkgname: packages[pkgname]
+                            for pkgname in possible_packages_to_mirror}
 
-    # 6. for each download:
-    # a. download to temp file
-    # b. validate contents of temp file
-    # c. move to local repo
-    # mirror all new packages
-    download_url, channel = _maybe_split_channel(upstream_channel)
-    with tempfile.TemporaryDirectory(dir=temp_directory) as download_dir:
-        logger.info('downloading to the tempdir %s', download_dir)
-        for package_name in sorted(to_mirror):
-            url = download_url.format(
-                channel=channel,
-                platform=platform,
-                file_name=package_name)
-            # TODO: Add actual concurrency here.
-            # Currently it's using asyncio, but only downloading a single
-            # package at a time.
-            await _download(url, download_dir)
-            summary['downloaded'].add((url, download_dir))
+        validation_results = _validate_packages(desired_repodata, local_directory, num_threads)
+        summary['validating-existing'].update(validation_results)
+        # 5. figure out final list of packages to mirror
+        # do the set difference of what is local and what is in the final
+        # mirror list
+        local_packages = _list_conda_packages(local_directory)
+        to_mirror = possible_packages_to_mirror - set(local_packages)
+        logger.info('to_mirror')
+        logger.info(pformat(sorted(to_mirror)))
 
-        # validate all packages in the download directory
-        validation_results = _validate_packages(packages, download_dir,
-                                                num_threads=num_threads)
-        summary['validating-new'].update(validation_results)
-        logger.debug('Newly downloaded files at %s are %s',
-                     download_dir,
-                     pformat(os.listdir(download_dir)))
+        # 6. for each download:
+        # a. download to temp file
+        # b. validate contents of temp file
+        # c. move to local repo
+        # mirror all new packages
+        download_url, channel = _maybe_split_channel(upstream_channel)
+        with tempfile.TemporaryDirectory(dir=temp_directory) as download_dir:
+            logger.info('downloading to the tempdir %s', download_dir)
+            for package_name in sorted(to_mirror):
+                url = download_url.format(
+                    channel=channel,
+                    platform=platform,
+                    file_name=package_name)
+                # TODO: Add actual concurrency here.
+                # Currently it's using asyncio, but only downloading a single
+                # package at a time.
+                await _download(url, download_dir)
+                summary['downloaded'].add((url, download_dir))
+    finally:
+        await session.close()
 
-        # 8. Use already downloaded repodata.json contents but prune it of
-        # packages we don't want
-        repodata = {'info': info, 'packages': packages}
+    # validate all packages in the download directory
+    validation_results = _validate_packages(packages, download_dir,
+                                            num_threads=num_threads)
+    summary['validating-new'].update(validation_results)
+    logger.debug('Newly downloaded files at %s are %s',
+                    download_dir,
+                    pformat(os.listdir(download_dir)))
 
-        # compute the packages that we have locally
-        packages_we_have = set(local_packages +
-                               _list_conda_packages(download_dir))
-        # remake the packages dictionary with only the packages we have
-        # locally
-        repodata['packages'] = {
-            name: info for name, info in repodata['packages'].items()
-            if name in packages_we_have}
-        _write_repodata(download_dir, repodata)
+    # 8. Use already downloaded repodata.json contents but prune it of
+    # packages we don't want
+    repodata = {'info': info, 'packages': packages}
 
-        # move new conda packages
-        for f in _list_conda_packages(download_dir):
-            old_path = os.path.join(download_dir, f)
-            new_path = os.path.join(local_directory, f)
-            logger.info("moving %s to %s", old_path, new_path)
-            shutil.move(old_path, new_path)
+    # compute the packages that we have locally
+    packages_we_have = set(local_packages +
+                            _list_conda_packages(download_dir))
+    # remake the packages dictionary with only the packages we have
+    # locally
+    repodata['packages'] = {
+        name: info for name, info in repodata['packages'].items()
+        if name in packages_we_have}
+    _write_repodata(download_dir, repodata)
 
-        for f in ('repodata.json', 'repodata.json.bz2'):
-            download_path = os.path.join(download_dir, f)
-            move_path = os.path.join(local_directory, f)
-            shutil.move(download_path, move_path)
+    # move new conda packages
+    for f in _list_conda_packages(download_dir):
+        old_path = os.path.join(download_dir, f)
+        new_path = os.path.join(local_directory, f)
+        logger.info("moving %s to %s", old_path, new_path)
+        shutil.move(old_path, new_path)
+
+    for f in ('repodata.json', 'repodata.json.bz2'):
+        download_path = os.path.join(download_dir, f)
+        move_path = os.path.join(local_directory, f)
+        shutil.move(download_path, move_path)
 
     # Also need to make a "noarch" channel or conda gets mad
     noarch_path = os.path.join(target_directory, 'noarch')

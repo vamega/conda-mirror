@@ -13,7 +13,7 @@ setup(
     platforms='Cross platform (Linux, Mac OSX, Windows)',
     license='BSD 3-Clause',
     install_requires=[
-        'requests',
+        'aiohttp>=2.2.0',
         'pyyaml',
     ],
     entry_points={

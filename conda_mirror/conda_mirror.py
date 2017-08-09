@@ -1,5 +1,8 @@
 import argparse
+import asyncio
 import bz2
+import fnmatch
+import functools
 import hashlib
 import json
 import logging
@@ -10,10 +13,9 @@ import shutil
 import sys
 import tarfile
 import tempfile
-import fnmatch
 from pprint import pformat
 
-import requests
+import aiohttp
 import yaml
 
 logger = None
@@ -249,7 +251,9 @@ def _parse_and_format_args():
 def cli():
     """Thin wrapper around parsing the cli args and calling main with them
     """
-    main(**_parse_and_format_args())
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(functools.partial(main,
+                            **_parse_and_format_args()))
 
 
 def _remove_package(pkg_path, reason):
@@ -333,7 +337,7 @@ def _validate(filename, md5=None, size=None):
     return filename, None
 
 
-def get_repodata(channel, platform):
+async def get_repodata(channel, platform):
     """Get the repodata.json file for a channel/platform combo on anaconda.org
 
     Parameters
@@ -352,7 +356,10 @@ def get_repodata(channel, platform):
     url_template, channel = _maybe_split_channel(channel)
     url = url_template.format(channel=channel, platform=platform,
                               file_name='repodata.json')
-    json = requests.get(url).json()
+    
+    async with session.get(url) as resp:
+        json = await resp.json()
+    # json = requests.get(url).json()
     return json.get('info', {}), json.get('packages', {})
 
 
@@ -372,10 +379,14 @@ def _download(url, target_directory):
     target_filename = url.split('/')[-1]
     download_filename = os.path.join(target_directory, target_filename)
     logger.debug('downloading to %s', download_filename)
+    
     with open(download_filename, 'w+b') as tf:
-        ret = requests.get(url, stream=True)
-        for data in ret.iter_content(chunk_size):
-            tf.write(data)
+        async with session.get(url) as resp:
+            async for data in resp.content.iter_chunked(chunk_size):
+                tf.write(data)
+        #ret = requests.get(url, stream=True)
+        #for data in ret.iter_content(chunk_size):
+        #    tf.write(data)
 
 
 def _list_conda_packages(local_dir):
@@ -500,7 +511,7 @@ def _validate_or_remove_package(args):
                      size=package_metadata.get('size'))
 
 
-def main(upstream_channel, target_directory, temp_directory, platform,
+async def main(upstream_channel, target_directory, temp_directory, platform,
          blacklist=None, whitelist=None, num_threads=1):
     """
 
@@ -590,7 +601,7 @@ def main(upstream_channel, target_directory, temp_directory, platform,
     if not os.path.exists(os.path.join(target_directory, platform)):
         os.makedirs(os.path.join(target_directory, platform))
 
-    info, packages = get_repodata(upstream_channel, platform)
+    info, packages = await get_repodata(upstream_channel, platform)
     local_directory = os.path.join(target_directory, platform)
 
     # 1. validate local repo
@@ -649,7 +660,10 @@ def main(upstream_channel, target_directory, temp_directory, platform,
                 channel=channel,
                 platform=platform,
                 file_name=package_name)
-            _download(url, download_dir)
+            # TODO: Add actual concurrency here.
+            # Currently it's using asyncio, but only downloading a single
+            # package at a time.
+            await _download(url, download_dir)
             summary['downloaded'].add((url, download_dir))
 
         # validate all packages in the download directory
